@@ -1,3 +1,7 @@
+//! Entities are data structures returned by the API, such as `Machine` or `App`.
+//! 
+
+
 
 pub mod app;
 
