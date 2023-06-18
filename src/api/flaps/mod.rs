@@ -6,6 +6,11 @@ mod types;
 pub use types::*;
 use crate::entities;
 
+mod transport;
+use transport::*;
+#[cfg(feature = "unix-socket")]
+mod unix;
+
 pub type Result<T> = std::result::Result<T, FlapsError>;
 
 #[derive(Error, Debug)]
@@ -41,7 +46,11 @@ pub enum FlapsError {
     #[error("Invalid endpoint: {0}")]
     InvalidUrl(#[from] url::ParseError),
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] http::Error),
+    #[error("HTTP error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+    #[error("Socket transport error: {0}")]
+    Hyper(#[from] hyper::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -99,11 +108,10 @@ pub struct FlapsSettings {
 }
 
 struct RawClient {
-    client: reqwest::Client,
+    client: Transport,
     // base_url: reqwest::Url,
-    app_url: reqwest::Url,
+    app_url: url::Url,
     user_agent: String,
-    auth_header: String,
     // app_name: String,
 }
 
@@ -123,7 +131,7 @@ fn default_base_url() -> String {
 
 const PROXY_TIMEOUT_THRESHOLD: Duration = Duration::from_secs(60);
 
-struct HeaderPair(&'static str, String);
+pub(crate) struct HeaderPair(&'static str, String);
 impl HeaderPair {
     fn lease_nonce(nonce: String) -> HeaderPair {
         HeaderPair("fly-machine-lease-nonce", nonce)
@@ -164,40 +172,45 @@ impl Client {
         };
 
         Ok(Client(Arc::new(RawClient {
-            client: reqwest::Client::new(),
+            client: HttpTransport(reqwest::Client::new(), auth_header).into(),
             app_url: base_url.join(format!("v1/apps/{}/machines", &app_name).as_str())?,
             // base_url,
             user_agent: cfg.user_agent.unwrap_or_else(|| format!("flyio-api-rs/{}", env!("CARGO_PKG_VERSION"))),
-            auth_header,
+            // app_name,
+        })))
+    }
+    
+    #[cfg(feature = "unix-socket")]
+    // TODO: Test this!
+    pub fn new_from_socket(app_name: Option<String>) -> std::result::Result<Client, FlapsClientCreationError> {
+        let app_name = app_name.or_else(crate::api::env::current_app_name).ok_or(FlapsClientCreationError::MissingAppName)?;
+        // Hostname unused, just has to exist. We use the unix socket to route.
+        let base_url = url::Url::parse("http://localhost").unwrap();
+
+        if app_name.chars().any(|c| matches!(c, '/'|':'|'\\')) {
+            return Err(FlapsClientCreationError::InvalidAppName(app_name));
+        }
+        let client = hyper::Client::builder().build(unix::UnixSocketConnector);
+
+        Ok(Client(Arc::new(RawClient {
+            client: UnixSocketTransport(client).into(),
+            app_url: base_url.join(format!("v1/apps/{}/machines", &app_name).as_str())?,
+            // base_url,
+            user_agent: format!("flyio-api-rs-unix/{}", env!("CARGO_PKG_VERSION")),
             // app_name,
         })))
     }
 
     async fn make_request_raw(&self, method: reqwest::Method, url: reqwest::Url, json: String, headers: Vec<HeaderPair>) -> Result<bytes::Bytes> {
 
-        let mut builder = self.0.client
-            .request(method, url)
-            .body(json)
-            .header("User-Agent", &self.0.user_agent)
-            .header("Content-Type", "application/json")
-            .header("Authorization", &self.0.auth_header);
+        let res = self.0.client.make_request(&self.0.user_agent, method, url, json, headers).await?;
+        let TransportResult {body, status_code, request_id} = res;
 
-        for HeaderPair(name, value) in headers {
-            builder = builder.header(name, value);
+        if status_code.as_u16() > 299 {
+            return Err(map_flaps_error(body, request_id, status_code));
         }
 
-        let response = builder.send()
-            .await?;
-
-        let status = response.status();
-        let fly_request_id = response.headers().get("fly-request-id").and_then(|v| v.to_str().ok().map(str::to_string));
-        let resp_bytes = response.bytes().await?;
-
-        if status.as_u16() > 299 {
-            return Err(map_flaps_error(resp_bytes, fly_request_id, status));
-        }
-
-        Ok(resp_bytes)
+        Ok(body)
     }
 
     async fn make_machines_request<

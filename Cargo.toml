@@ -11,11 +11,15 @@ keywords = ["flyio", "fly", "cloud", "api"]
 
 [dependencies]
 arrayvec = "0.7.2"
+async-trait = "0.1.68"
 backoff = { version = "0.4.0", features = ["tokio"] }
 bytes = "1.4.0"
 chrono = "0.4.26"
 futures = "0.3.28"
+http = "0.2.9"
+hyper = { version = "0.14.26", optional = true }
 phf = { version = "0.11.1", features = ["macros"] }
+pin-project = "1.1.0"
 reqwest = "0.11.18"
 serde = { version = "1.0.164", features = ["derive", "alloc"] }
 serde_json = "1.0.96"
@@ -23,3 +27,6 @@ thiserror = "1.0.40"
 tokio = { version = "1.28.2", features = ["sync"] }
 url = "2.4.0"
 urlencoding = "2.1.2"
+
+[features]
+unix-socket = ["hyper"]
