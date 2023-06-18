@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, BTreeMap}, hash::Hash,
+    collections::{HashMap, BTreeMap}, hash::Hash, fmt::{Display, Formatter},
 };
 
 use phf::phf_map;
@@ -614,5 +614,10 @@ impl State {
     pub fn name(&self) -> String {
         // Gross hack, abuse serde to do the work for us
         serde_json::to_string(self).unwrap().trim_matches('"').to_string()
+    }
+}
+impl Display for State {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
     }
 }

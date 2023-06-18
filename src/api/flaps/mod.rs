@@ -65,9 +65,18 @@ pub enum FlapsError {
 
     #[error("Not found")]
     NotFound(RawApiError),
+
+    #[error("Timed out waiting for machine to reach desired state '{desired_state}'")]
+    DesiredStateNotReached{desired_state: crate::entities::machine::State, raw: RawApiError},
 }
 
-fn map_flaps_error(body: bytes::Bytes, fly_request_id: Option<String>, status: reqwest::StatusCode) -> FlapsError {
+// Used to determine the behavior of [`map_flaps_error`]
+enum ApiEndpoint {
+    Other,
+    Wait(crate::entities::machine::State),
+}
+
+fn map_flaps_error(body: bytes::Bytes, fly_request_id: Option<String>, status: reqwest::StatusCode, endpoint: ApiEndpoint) -> FlapsError {
 
     if status.is_success() {
         unreachable!("map_flaps_error called with success status code")
@@ -92,6 +101,17 @@ fn map_flaps_error(body: bytes::Bytes, fly_request_id: Option<String>, status: r
     });
 
     // Attempt to use string comparison to map errors to strong types
+
+    match endpoint {
+        ApiEndpoint::Wait(desired_state) => {
+            if status == http::StatusCode::REQUEST_TIMEOUT {
+                return FlapsError::DesiredStateNotReached{desired_state, raw: raw_api_err};
+            }
+        },
+        ApiEndpoint::Other => {},
+    }
+
+
     if status == reqwest::StatusCode::NOT_FOUND {
         return FlapsError::NotFound(raw_api_err);
     }
@@ -179,7 +199,7 @@ impl Client {
             // app_name,
         })))
     }
-    
+
     #[cfg(feature = "unix-socket")]
     // TODO: Test this!
     pub fn new_from_socket(app_name: Option<String>) -> std::result::Result<Client, FlapsClientCreationError> {
@@ -201,13 +221,13 @@ impl Client {
         })))
     }
 
-    async fn make_request_raw(&self, method: reqwest::Method, url: reqwest::Url, json: String, headers: Vec<HeaderPair>) -> Result<bytes::Bytes> {
+    async fn make_request_raw(&self, method: reqwest::Method, url: reqwest::Url, json: String, headers: Vec<HeaderPair>, api_endpoint: ApiEndpoint) -> Result<bytes::Bytes> {
 
         let res = self.0.client.make_request(&self.0.user_agent, method, url, json, headers).await?;
         let TransportResult {body, status_code, request_id} = res;
 
         if status_code.as_u16() > 299 {
-            return Err(map_flaps_error(body, request_id, status_code));
+            return Err(map_flaps_error(body, request_id, status_code, api_endpoint));
         }
 
         Ok(body)
@@ -222,10 +242,11 @@ impl Client {
         endpoint: &str,
         data: Req,
         headers: Vec<HeaderPair>,
+        api_endpoint: ApiEndpoint,
     ) -> Result<Res> {
 
         let json = serde_json::to_string(&data)?;
-        let bytes = self.make_request_raw(method, self.0.app_url.join(endpoint)?, json, headers).await?;
+        let bytes = self.make_request_raw(method, self.0.app_url.join(endpoint)?, json, headers, api_endpoint).await?;
         let response = serde_json::from_slice(&bytes)?;
         Ok(response)
     }
@@ -240,23 +261,24 @@ impl Client {
         data: Req,
         res: &mut Res,
         headers: Vec<HeaderPair>,
+        api_endpoint: ApiEndpoint,
     ) -> Result<()> {
 
         let json = serde_json::to_string(&data)?;
-        let bytes = self.make_request_raw(method, self.0.app_url.join(endpoint)?, json, headers).await?;
+        let bytes = self.make_request_raw(method, self.0.app_url.join(endpoint)?, json, headers, api_endpoint).await?;
         let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
         Res::deserialize_in_place(&mut deserializer, res)?;
         Ok(())
     }
 
     pub async fn launch(&self, req: LaunchMachineInput) -> Result<entities::machine::Machine> {
-        self.make_machines_request(reqwest::Method::POST, "", req, Vec::new()).await
+        self.make_machines_request(reqwest::Method::POST, "", req, Vec::new(), ApiEndpoint::Other).await
     }
     pub async fn update(&self, req: LaunchMachineInput, nonce: Option<String>) -> Result<entities::machine::Machine> {
         let mut headers = Vec::new();
         add_lease_nonce(&mut headers, nonce);
 
-        self.make_machines_request(reqwest::Method::POST, req.id.as_ref().ok_or(FlapsError::NoMachineId)?.as_str(), &req, headers).await
+        self.make_machines_request(reqwest::Method::POST, req.id.as_ref().ok_or(FlapsError::NoMachineId)?.as_str(), &req, headers, ApiEndpoint::Other).await
     }
     pub async fn start<M: AsMachineId>(&self, machine: M, nonce: Option<String>) -> Result<MachineStartResponse> {
         let mut headers = Vec::new();
@@ -264,10 +286,11 @@ impl Client {
 
         let machine_id = machine.as_machine_id();
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{machine_id}/start"), (), headers).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{machine_id}/start"), (), headers, ApiEndpoint::Other).await
     }
     /// Waits for a machine to reach a state.
     /// The timeout is clamped between one second and [`PROXY_TIMEOUT_THRESHOLD`].
+    /// If you want a longer timeout, use [`wait_for_state`], which calls this method repeatedly until the timeout is reached or the machine reaches the desired state.
     pub async fn wait(&self, machine: &entities::machine::Machine, state: Option<entities::machine::State>, timeout: Duration) -> Result<()> {
 
         let machine_id = &machine.id;
@@ -286,14 +309,47 @@ impl Client {
             UrlParam("timeout", &timeout_secs.to_string()),
         ]);
 
-        self.make_machines_request(reqwest::Method::GET, &format!("{machine_id}/wait{wait_query}"), (), Vec::new()).await
+        self.make_machines_request(reqwest::Method::GET, &format!("{machine_id}/wait{wait_query}"), (), Vec::new(), ApiEndpoint::Wait(state)).await
+        
     }
+
+    pub async fn wait_for_state(&self, machine: &entities::machine::Machine, state: Option<entities::machine::State>, timeout: Duration) -> Result<()> {
+        let n = backoff::ExponentialBackoffBuilder::new()
+            .with_initial_interval(Duration::from_millis(500))
+            .with_max_interval(Duration::from_millis(5000))
+            .with_multiplier(1.5)
+            .with_max_elapsed_time(Some(timeout))
+            .build();
+
+        let end_time = std::time::Instant::now() + timeout + Duration::from_millis(100);
+
+        backoff::future::retry(n, || async {
+
+            let current_time = std::time::Instant::now();
+            let time_left = (end_time - current_time).min(Duration::from_secs(2));
+
+            match self.wait(machine, state.clone(), time_left).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if matches!(e, FlapsError::DesiredStateNotReached{..}) {
+                        Err(backoff::Error::Transient{
+                            err: e,
+                            retry_after: None,
+                        })
+                    } else {
+                        Err(backoff::Error::Permanent(e))
+                    }
+                }
+            }
+        }).await
+    }
+
 
     pub async fn stop(&self, stop_input: StopMachineInput, nonce: Option<String>) -> Result<()> {
         let mut headers = Vec::new();
         add_lease_nonce(&mut headers, nonce);
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{}/stop", stop_input.id), stop_input, headers).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{}/stop", stop_input.id), stop_input, headers, ApiEndpoint::Other).await
     }
 
     pub async fn restart(&self, restart_input: RestartMachineInput, nonce: Option<String>) -> Result<()> {
@@ -316,13 +372,13 @@ impl Client {
         }
         let restart_query = encode_url_params(&url_params);
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{machine_id}/restart{restart_query}"), (), headers).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{machine_id}/restart{restart_query}"), (), headers, ApiEndpoint::Other).await
     }
 
     pub async fn get<M: AsMachineId>(&self, machine: &M) -> Result<entities::machine::Machine> {
         let machine_id = machine.as_machine_id();
 
-        self.make_machines_request(reqwest::Method::GET, machine_id, (), Vec::new()).await
+        self.make_machines_request(reqwest::Method::GET, machine_id, (), Vec::new(), ApiEndpoint::Other).await
     }
 
     pub async fn get_many<M: AsMachineId>(&self, machine_ids: &[M]) -> Result<Vec<entities::machine::Machine>> {
@@ -333,11 +389,24 @@ impl Client {
     }
 
     pub async fn list(&self, state: Option<&str>) -> Result<Vec<entities::machine::Machine>> {
-        self.make_machines_request(reqwest::Method::GET, &state.map(|s| "?".to_string() + s).unwrap_or_default(), (), Vec::new()).await
+        self.make_machines_request(
+            reqwest::Method::GET,
+            &state.map(|s| "?".to_string() + s).unwrap_or_default(),
+            (),
+            Vec::new(),
+            ApiEndpoint::Other
+        ).await
     }
     #[doc(hidden)]
     pub async fn list_into(&self, vec: &mut Vec<entities::machine::Machine>, state: Option<&str>) -> Result<()> {
-        self.make_machines_request_into(reqwest::Method::GET, &state.map(|s| "?".to_string() + s).unwrap_or_default(), (), vec, Vec::new()).await
+        self.make_machines_request_into(
+            reqwest::Method::GET,
+            &state.map(|s| "?".to_string() + s).unwrap_or_default(),
+            (),
+            vec,
+            Vec::new(),
+            ApiEndpoint::Other
+        ).await
     }
 
     /// returns only non-destroyed machines that aren't in a reserved process group
@@ -402,19 +471,26 @@ impl Client {
             false => "false",
         };
 
-        self.make_machines_request(reqwest::Method::DELETE, &format!("{}/destroy?kill={kill}", input.id), (), headers).await
+        self.make_machines_request(reqwest::Method::DELETE, &format!("{}/destroy?kill={kill}", input.id), (), headers, ApiEndpoint::Other).await
     }
 
     pub async fn kill<M: AsMachineId>(&self, machine: M) -> Result<()> {
         let machine_id = machine.as_machine_id();
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{}/signal", machine_id), Signal::from(9), Vec::new()).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{}/signal", machine_id), Signal::from(9), Vec::new(), ApiEndpoint::Other).await
     }
 
     pub async fn find_lease<M: AsMachineId>(&self, machine: M) -> Result<Option<MachineLease>> {
         let machine_id = machine.as_machine_id();
 
-        let res = self.make_machines_request(reqwest::Method::GET, &format!("{}/lease", machine_id), (), Vec::new()).await;
+        let res = self.make_machines_request(
+            reqwest::Method::GET,
+            &format!("{}/lease", machine_id),
+            (),
+            Vec::new(),
+            ApiEndpoint::Other,
+        ).await;
+
         match res {
             Ok(lease) => Ok(Some(lease)),
             Err(FlapsError::NotFound(raw)) => {
@@ -438,7 +514,7 @@ impl Client {
         }
         let lease_query = encode_url_params(&url_params);
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{}/lease{lease_query}", machine_id), (), Vec::new()).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{}/lease{lease_query}", machine_id), (), Vec::new(), ApiEndpoint::Other).await
     }
 
     pub async fn refresh_lease<M: AsMachineId>(&self, machine: M, ttl: Option<i32>, nonce: String) -> Result<MachineLease> {
@@ -453,7 +529,7 @@ impl Client {
         }
         let lease_query = encode_url_params(&url_params);
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{}/lease/refresh{lease_query}", machine_id), (), headers).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{}/lease/refresh{lease_query}", machine_id), (), headers, ApiEndpoint::Other).await
     }
 
     pub async fn release_lease<M: AsMachineId>(&self, machine: M, nonce: Option<String>) -> Result<()> {
@@ -462,18 +538,18 @@ impl Client {
         let mut headers = Vec::new();
         add_lease_nonce(&mut headers, nonce);
 
-        self.make_machines_request(reqwest::Method::DELETE, &format!("{}/lease", machine_id), (), headers).await
+        self.make_machines_request(reqwest::Method::DELETE, &format!("{}/lease", machine_id), (), headers, ApiEndpoint::Other).await
     }
 
     pub async fn exec<M: AsMachineId>(&self, machine: M, input: MachineExecRequest) -> Result<MachineExecResponse> {
         let machine_id = machine.as_machine_id();
 
-        self.make_machines_request(reqwest::Method::POST, &format!("{}/exec", machine_id), input, Vec::new()).await
+        self.make_machines_request(reqwest::Method::POST, &format!("{}/exec", machine_id), input, Vec::new(), ApiEndpoint::Other).await
     }
 
     pub async fn get_processes<M: AsMachineId>(&self, machine: M) -> Result<Vec<crate::entities::ProcessStat>> {
         let machine_id = machine.as_machine_id();
 
-        self.make_machines_request(reqwest::Method::GET, &format!("{}/ps", machine_id), (), Vec::new()).await
+        self.make_machines_request(reqwest::Method::GET, &format!("{}/ps", machine_id), (), Vec::new(), ApiEndpoint::Other).await
     }
 }
